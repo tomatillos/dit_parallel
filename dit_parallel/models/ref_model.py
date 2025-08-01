@@ -148,7 +148,6 @@ class DiT(nn.Module):
             .reshape(B, self.out_c, h * p, w * p)
         )
 
-    @torch.compile
     def forward(self, img, t, y):
         x = self.patch(img) + self.pos.unsqueeze(0)
         x = x + (self.time(t) + self.label(y, self.training)).unsqueeze(1)

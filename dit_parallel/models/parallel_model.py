@@ -21,9 +21,11 @@ class Attention(nn.Module):
         assert dim % num_heads == 0
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
+        # old:
         # self.qkv = nn.Linear(dim, dim * 3)
         self.qkv = ColumnParallelLinear(dim, dim * 3, tp_dim=ctx.tp_pg.size(), ctx=ctx)
         self.attn_drop = nn.Dropout(attn_drop)
+        # old:
         # self.proj = nn.Linear(dim, dim)
         self.proj = RowParallelLinear(
             dim,
@@ -48,6 +50,7 @@ class Attention(nn.Module):
         ###
         # assumes x has already been split along the cp dimension
         x = ring_attention(q, k, v, dropout_p, self.ctx, backend="flash")
+        ###
         x = x.transpose(1, 2).reshape(B, N, C // self.ctx.tp_pg.size())
         return self.proj_drop(self.proj(x))
 
@@ -124,9 +127,11 @@ class Block(nn.Module):
         self.attn = Attention(d, heads, ctx, attn_drop, proj_drop)
         self.n2 = nn.LayerNorm(d)
         self.mlp = nn.Sequential(
+            # old:
             # nn.Linear(d, d * mlp_ratio),
             ColumnParallelLinear(d, d * mlp_ratio, tp_dim=ctx.tp_pg.size(), ctx=ctx),
             nn.GELU(),
+            # old:
             # nn.Linear(d * mlp_ratio, d),
             RowParallelLinear(
                 d * mlp_ratio, d, tp_dim=ctx.tp_pg.size(), ctx=ctx, all_reduce_out=True
@@ -190,7 +195,7 @@ class ParallelDiT(nn.Module):
 
 if __name__ == "__main__":
     size = 2048
-    ctx = setup_distributed(tp_dim=8, cp_dim=1)
+    ctx = setup_distributed(tp_dim=4, cp_dim=2)
     torch.cuda.set_device(dist.get_rank())
     device = f"cuda:{dist.get_rank()}"
     model = ParallelDiT(

@@ -1,9 +1,11 @@
 import subprocess
+
 import torch
 from torch import distributed as dist
+from torchao.quantization import quantize_, Float8DynamicActivationFloat8WeightConfig
 
 from dit_parallel.context import setup_distributed
-from parallel_model import ParallelDiT
+from dit_parallel.models.parallel_model import ParallelDiT
 
 
 def print0(s: str):
@@ -11,16 +13,21 @@ def print0(s: str):
         print(s)
 
 
-def profile():
+def profile_model():
     size = 2048
-    TP_DIM = 1
-    CP_DIM = 8
+    TP_DIM = 2
+    CP_DIM = 4
     assert TP_DIM * CP_DIM == torch.cuda.device_count()
     ctx = setup_distributed(tp_dim=TP_DIM, cp_dim=CP_DIM)
     device = f"cuda:{dist.get_rank()}"
+    torch.cuda.set_device(dist.get_rank())
+
     model = ParallelDiT(
         ctx=ctx, img_size=size, patch_size=8, d=512, depth=28, heads=16
     ).to(device, dtype=torch.bfloat16)
+
+    print0("Quantizing model")
+    quantize_(model.blocks, Float8DynamicActivationFloat8WeightConfig())
 
     torch.manual_seed(1234)
     print0(f"Starting warmup for {TP_DIM}x{CP_DIM}x{dist.get_rank()}")
@@ -60,12 +67,13 @@ def profile():
     print0(f"Throughput: {1000 / avg_time:.2f} images/s")
 
     with torch.profiler.profile() as prof:
-        model(img, t, y)
+        with torch.no_grad():
+            model(img, t, y)
 
     from datetime import datetime
 
     timestamp = datetime.now().strftime("%H%M")
-    profile_name = f"dit_tp{TP_DIM}_cp{CP_DIM}_rank{dist.get_rank()}_{timestamp}"
+    profile_name = f"{timestamp}_dit_tp{TP_DIM}_cp{CP_DIM}_rank{dist.get_rank()}"
 
     prof.export_chrome_trace(f"/tmp/traces/{profile_name}.json")
     subprocess.run(
@@ -79,4 +87,4 @@ def profile():
 
 
 if __name__ == "__main__":
-    profile()
+    profile_model()

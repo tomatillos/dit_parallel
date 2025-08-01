@@ -11,7 +11,7 @@ from dit_parallel.context import Context
 flex_attention = torch.compile(flex_attention)
 
 
-class ColumnParallelLinear(nn.Module):
+class ColumnParallelLinear(nn.Linear):
     def __init__(
         self,
         d_in: int,
@@ -21,23 +21,18 @@ class ColumnParallelLinear(nn.Module):
         all_gather_out: bool = False,
         with_bias: bool = True,
     ):
-        super().__init__()
+
         assert d_out % tp_dim == 0
         local_d_out = d_out // tp_dim
+        super().__init__(in_features=d_in, out_features=local_d_out, bias=with_bias)
         self.tp_dim = tp_dim
-        self.weight = nn.Parameter(torch.empty(local_d_out, d_in))
-        self.bias = None
-        if with_bias:
-            self.bias = nn.Parameter(torch.empty(local_d_out))
 
         self.all_gather_out = all_gather_out
         self.ctx = ctx
         assert self.ctx.tp_pg.size() == tp_dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = x @ self.weight.T
-        if self.bias is not None:
-            out = out + self.bias
+        out = super().forward(x)
         if self.all_gather_out:
             out_tensors = [torch.empty_like(out) for _ in range(self.tp_dim)]
             dist.all_gather(out_tensors, out, group=self.ctx.tp_pg)
@@ -45,7 +40,7 @@ class ColumnParallelLinear(nn.Module):
         return out
 
 
-class RowParallelLinear(nn.Module):
+class RowParallelLinear(nn.Linear):
     def __init__(
         self,
         d_in: int,
@@ -55,26 +50,20 @@ class RowParallelLinear(nn.Module):
         all_reduce_out: bool = True,
         with_bias: bool = True,
     ):
-        super().__init__()
         assert d_in % tp_dim == 0
         local_d_in = d_in // tp_dim
-        self.weight = nn.Parameter(torch.empty(d_out, local_d_in))
-        self.bias = None
-        if with_bias:
-            self.bias = nn.Parameter(torch.empty(d_out))
-        self.all_reduce_out = all_reduce_out
+        super().__init__(in_features=local_d_in, out_features=d_out, bias=with_bias)
         self.ctx = ctx
+        # remember to rescale the bias when loading weights
+        self.all_reduce_out = all_reduce_out
         assert self.ctx.tp_pg.size() == tp_dim
         if with_bias and not all_reduce_out:
             raise NotImplementedError
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = x @ self.weight.T
+        out = super().forward(x)
         if self.all_reduce_out:
             dist.all_reduce(out, op=dist.ReduceOp.SUM, group=self.ctx.tp_pg)
-        # add bias after the all-reduce
-        if self.bias is not None:
-            out = out + self.bias
         return out
 
 
@@ -112,27 +101,25 @@ def ring_attention(
 
         if backend == "flash":
             new_attn_out, new_lse, _ = flash_attn_func(
-                q,
-                k,
-                v,
-                dropout_p=dropout_p,
-                return_attn_probs=True,
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), return_attn_probs=True
             )
-            new_lse = new_lse.transpose(1, 2).unsqueeze(-1)
+            new_attn_out = new_attn_out.transpose(1,2)
         elif backend == "flex":
             new_attn_out, new_lse = flex_attention(q, k, v, return_lse=True)
-            new_lse = new_lse.unsqueeze(-1)
         else:
             raise ValueError(
                 f"Invalid backend: {backend}, should be one of ['flash', 'flex']"
             )
 
-        # and then do the recombine
+        new_attn_out = new_attn_out.to(q.dtype)
+        new_lse = new_lse.to(q.dtype)
+        new_lse = new_lse.unsqueeze(-1)
+        # merge the two attention states
         if step == 0:
             lse = new_lse
             attn_out = new_attn_out
         else:
-            # slightly unintuitive merge formula, torch.dist does it this way
+            # slightly unintuitive merge formula, torch.dist does it this way:
             # https://github.com/pytorch/pytorch/blob/3967dbedf4bd7ecb8bfae93e5b8ec78e8f523b9a/torch/distributed/tensor/experimental/_attention.py#L201
             # cf https://github.com/zhuzilin/ring-flash-attention/pull/34#issuecomment-2076126795
             attn_out = attn_out - F.sigmoid(new_lse - lse) * (attn_out - new_attn_out)
@@ -145,6 +132,7 @@ def ring_attention(
             # now buf is the next one, so swap
             k, k_buf = k_buf, k
             v, v_buf = v_buf, v
+
 
     return attn_out.to(k.dtype)
 
