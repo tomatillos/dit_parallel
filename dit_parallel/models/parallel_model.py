@@ -3,38 +3,52 @@ from __future__ import annotations
 import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torch import distributed as dist
+
+from dit_parallel.layers import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    ring_attention,
+    split_tensor_cp,
+    gather_tensor_cp,
+)
+from dit_parallel.context import Context, setup_distributed
 
 
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads, attn_drop=0.0, proj_drop=0.0):
+    def __init__(self, dim, num_heads, ctx: Context, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.qkv = nn.Linear(dim, dim * 3)
+        # self.qkv = nn.Linear(dim, dim * 3)
+        self.qkv = ColumnParallelLinear(dim, dim * 3, tp_dim=ctx.tp_pg.size(), ctx=ctx)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
+        # self.proj = nn.Linear(dim, dim)
+        self.proj = RowParallelLinear(
+            dim,
+            dim,
+            tp_dim=ctx.tp_pg.size(),
+            ctx=ctx,
+            all_reduce_out=True,
+        )
         self.proj_drop = nn.Dropout(proj_drop)
+        self.ctx = ctx
+        self.num_local_heads = self.num_heads // ctx.tp_pg.size()
 
     def forward(self, x):
         B, N, C = x.shape
         qkv = (
             self.qkv(x)
-            .reshape(B, N, 3, self.num_heads, self.head_dim)
+            .reshape(B, N, 3, self.num_local_heads, self.head_dim)
             .permute(2, 0, 3, 1, 4)
         )
         q, k, v = qkv
-        x = (
-            F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                dropout_p=self.attn_drop.p if self.training else 0.0,
-            )
-            .transpose(1, 2)
-            .reshape(B, N, C)
-        )
+        dropout_p = self.attn_drop.p if self.training else 0.0
+        ###
+        # assumes x has already been split along the cp dimension
+        x = ring_attention(q, k, v, dropout_p, self.ctx, backend="flash")
+        x = x.transpose(1, 2).reshape(B, N, C // self.ctx.tp_pg.size())
         return self.proj_drop(self.proj(x))
 
 
@@ -102,15 +116,21 @@ class LabelEmbedder(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, d, heads, mlp_ratio=4, attn_drop=0.0, proj_drop=0.0):
+    def __init__(
+        self, d, heads, ctx: Context, mlp_ratio=4, attn_drop=0.0, proj_drop=0.0
+    ):
         super().__init__()
         self.n1 = nn.LayerNorm(d)
-        self.attn = Attention(d, heads, attn_drop, proj_drop)
+        self.attn = Attention(d, heads, ctx, attn_drop, proj_drop)
         self.n2 = nn.LayerNorm(d)
         self.mlp = nn.Sequential(
-            nn.Linear(d, d * mlp_ratio),
+            # nn.Linear(d, d * mlp_ratio),
+            ColumnParallelLinear(d, d * mlp_ratio, tp_dim=ctx.tp_pg.size(), ctx=ctx),
             nn.GELU(),
-            nn.Linear(d * mlp_ratio, d),
+            # nn.Linear(d * mlp_ratio, d),
+            RowParallelLinear(
+                d * mlp_ratio, d, tp_dim=ctx.tp_pg.size(), ctx=ctx, all_reduce_out=True
+            ),
             nn.Dropout(proj_drop),
         )
 
@@ -119,11 +139,20 @@ class Block(nn.Module):
         return x + self.mlp(self.n2(x))
 
 
-class DiT(nn.Module):
+class ParallelDiT(nn.Module):
     def __init__(
-        self, img_size=4096, patch_size=8, in_c=4, d=512, depth=28, heads=16, n_cls=1000
+        self,
+        ctx: Context,
+        img_size=4096,
+        patch_size=8,
+        in_c=4,
+        d=512,
+        depth=28,
+        heads=16,
+        n_cls=1000,
     ):
         super().__init__()
+        self.ctx = ctx
         self.patch = PatchEmbed(img_size, patch_size, in_c, d)
         self.register_buffer(
             "pos",
@@ -132,7 +161,7 @@ class DiT(nn.Module):
         )
         self.time = TimestepEmbedder(d)
         self.label = LabelEmbedder(n_cls, d, 0.1)
-        self.blocks = nn.ModuleList([Block(d, heads) for _ in range(depth)])
+        self.blocks = nn.ModuleList([Block(d, heads, ctx=ctx) for _ in range(depth)])
         self.norm = nn.LayerNorm(d)
         self.head = nn.Linear(d, patch_size * patch_size * in_c)
         self.out_c = in_c
@@ -148,25 +177,31 @@ class DiT(nn.Module):
             .reshape(B, self.out_c, h * p, w * p)
         )
 
+    @torch.compile
     def forward(self, img, t, y):
         x = self.patch(img) + self.pos.unsqueeze(0)
         x = x + (self.time(t) + self.label(y, self.training)).unsqueeze(1)
+        x = split_tensor_cp(x, dim=1, ctx=self.ctx)
         for blk in self.blocks:
             x = blk(x)
+        x = gather_tensor_cp(x, dim=1, ctx=self.ctx)
         return self._unpatch(self.head(self.norm(x)))
 
 
 if __name__ == "__main__":
     size = 2048
-    model = DiT(img_size=size, patch_size=8, d=512, depth=28, heads=16).to(
-        "cuda", dtype=torch.bfloat16
-    )
+    ctx = setup_distributed(tp_dim=8, cp_dim=1)
+    torch.cuda.set_device(dist.get_rank())
+    device = f"cuda:{dist.get_rank()}"
+    model = ParallelDiT(
+        ctx=ctx, img_size=size, patch_size=8, d=512, depth=28, heads=16
+    ).to(device, dtype=torch.bfloat16)
 
     # Warmup
     for _ in range(3):
-        img = torch.randn(1, 4, size, size).to("cuda", dtype=torch.bfloat16)
-        t = torch.randint(0, 1000, (1,)).to("cuda", dtype=torch.bfloat16)
-        y = torch.randint(0, 1000, (1,)).to("cuda")
+        img = torch.randn(1, 4, size, size).to(device, dtype=torch.bfloat16)
+        t = torch.randint(0, 1000, (1,)).to(device, dtype=torch.bfloat16)
+        y = torch.randint(0, 1000, (1,)).to(device)
         with torch.no_grad():
             out = model(img, t, y)
 
@@ -177,9 +212,9 @@ if __name__ == "__main__":
 
     times = []
     for _ in range(10):
-        img = torch.randn(1, 4, size, size).to("cuda", dtype=torch.bfloat16)
-        t = torch.randint(0, 1000, (1,)).to("cuda", dtype=torch.bfloat16)
-        y = torch.randint(0, 1000, (1,)).to("cuda")
+        img = torch.randn(1, 4, size, size).to(device, dtype=torch.bfloat16)
+        t = torch.randint(0, 1000, (1,)).to(device, dtype=torch.bfloat16)
+        y = torch.randint(0, 1000, (1,)).to(device)
 
         torch.cuda.synchronize()
         start_event.record()
@@ -193,4 +228,4 @@ if __name__ == "__main__":
 
     avg_time = sum(times) / len(times)
     print(f"Average inference time: {avg_time:.2f} ms")
-    print(f"Throughput: {1000/avg_time:.2f} images/s")
+    print(f"Throughput: {1000 / avg_time:.2f} images/s")

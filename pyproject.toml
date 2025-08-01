@@ -7,5 +7,19 @@ requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.3.2",
     "torch>=2.7.1",
-    "flash-attn"
 ]
+
+[project.optional-dependencies]
+build = ["torch"]
+compile = ["flash-attn"]
+
+[tool.setuptools.packages.find]
+exclude = ["test_outputs*", "*.tests", "*.tests.*", "tests.*", "tests"]
+
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]
+
+[[tool.uv.dependency-metadata]]
+name = "flash-attn"
+version = "2.6.3"
+requires-dist = ["torch", "einops"]
