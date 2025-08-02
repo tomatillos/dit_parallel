@@ -17,7 +17,7 @@ def profile_model():
     size = 2048
     TP_DIM = 2
     CP_DIM = 4
-    assert TP_DIM * CP_DIM == torch.cuda.device_count()
+    assert TP_DIM * CP_DIM == torch.cuda.device_count(), f"TP_DIM * CP_DIM ({TP_DIM * CP_DIM}) != torch.cuda.device_count() ({torch.cuda.device_count()})"
     ctx = setup_distributed(tp_dim=TP_DIM, cp_dim=CP_DIM)
     device = f"cuda:{dist.get_rank()}"
     torch.cuda.set_device(dist.get_rank())

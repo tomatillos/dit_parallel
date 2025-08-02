@@ -11,7 +11,7 @@ class Context:
     cp_pg: dist.ProcessGroup
 
 
-def setup_distributed(tp_dim: int, cp_dim: int):
+def setup_distributed(tp_dim: int, cp_dim: int) -> Context:
     dist.init_process_group(
         backend="nccl",
         init_method="env://",

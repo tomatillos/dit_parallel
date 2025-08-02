@@ -1,70 +1,59 @@
+from typing import Literal
+
 import torch
-from torch import nn
 from torch import distributed as dist
 from torch.nn import functional as F
-from typing import Literal
+
+# flexattention
 from torch.nn.attention.flex_attention import flex_attention
+# fa3 
+import flash_attn_interface
+# fa2
 from flash_attn import flash_attn_func
 
 from dit_parallel.context import Context
 
+
 flex_attention = torch.compile(flex_attention)
 
 
-class ColumnParallelLinear(nn.Linear):
-    def __init__(
-        self,
-        d_in: int,
-        d_out: int,
-        tp_dim: int,
-        ctx: Context,
-        all_gather_out: bool = False,
-        with_bias: bool = True,
-    ):
 
-        assert d_out % tp_dim == 0
-        local_d_out = d_out // tp_dim
-        super().__init__(in_features=d_in, out_features=local_d_out, bias=with_bias)
-        self.tp_dim = tp_dim
+# custom op + fake implementation so fa3 works with torch.compile
 
-        self.all_gather_out = all_gather_out
-        self.ctx = ctx
-        assert self.ctx.tp_pg.size() == tp_dim
+@torch.library.custom_op("flash::torch_fa3", mutates_args=())
+def torch_fa3(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    softmax_scale = q.shape[-1] ** -0.5
+    out, softmax_lse, *rest = flash_attn_interface._flash_attn_forward(
+        q,
+        k,
+        v,
+        None, None,  # k_new, v_new
+        None,  # qv
+        None,  # out
+        None, None, None,   # cu_seqlens_q/k/k_new
+        None, None,   # seqused_q/k
+        None, None,   # max_seqlen_q/k
+        None, None, None,   # page_table, kv_batch_idx, leftpad_k,
+        None, None, None,  # rotary_cos/sin, seqlens_rotary
+        None, None, None,
+        softmax_scale,
+        causal=False,
+        window_size=(-1, -1),
+        attention_chunk=0,
+        softcap=0.0,
+        num_splits=1,
+        pack_gqa=None,
+        sm_margin=0,
+    )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = super().forward(x)
-        if self.all_gather_out:
-            out_tensors = [torch.empty_like(out) for _ in range(self.tp_dim)]
-            dist.all_gather(out_tensors, out, group=self.ctx.tp_pg)
-            out = torch.cat(out_tensors, dim=-1).to(out.device)
-        return out
+    return out, softmax_lse
 
 
-class RowParallelLinear(nn.Linear):
-    def __init__(
-        self,
-        d_in: int,
-        d_out: int,
-        tp_dim: int,
-        ctx: Context,
-        all_reduce_out: bool = True,
-        with_bias: bool = True,
-    ):
-        assert d_in % tp_dim == 0
-        local_d_in = d_in // tp_dim
-        super().__init__(in_features=local_d_in, out_features=d_out, bias=with_bias)
-        self.ctx = ctx
-        # remember to rescale the bias when loading weights
-        self.all_reduce_out = all_reduce_out
-        assert self.ctx.tp_pg.size() == tp_dim
-        if with_bias and not all_reduce_out:
-            raise NotImplementedError
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = super().forward(x)
-        if self.all_reduce_out:
-            dist.all_reduce(out, op=dist.ReduceOp.SUM, group=self.ctx.tp_pg)
-        return out
+@torch_fa3.register_fake
+def _(q, k, v, **kwargs):
+    # returns out, lse
+    _out = torch.empty_like(q, dtype=torch.bfloat16)
+    return _out, q.new_empty((q.size(0), q.size(2), q.size(1)), dtype=torch.float32)
 
 
 def ring_attention(
@@ -73,9 +62,15 @@ def ring_attention(
     v: torch.Tensor,
     dropout_p: float,
     ctx: Context,
-    backend: Literal["flash", "flex"] = "flash",
+    backend: Literal["fa2", "fa3", "flex"] = "fa3",
+    dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Functional ring attention implementation."""
+    """Functional ring attention implementation.
+    Assumes that q, k, v are already split along the context parallel dim."""
+
+    q = q.to(dtype)
+    k = k.to(dtype)
+    v = v.to(dtype)
 
     k = k.contiguous()
     v = v.contiguous()
@@ -99,20 +94,26 @@ def ring_attention(
             recv_v = dist.P2POp(dist.irecv, v_buf, group=ctx.cp_pg, group_peer=prev_loc)
             reqs = dist.batch_isend_irecv([send_k, recv_k, send_v, recv_v])
 
-        if backend == "flash":
+        if backend == "fa3":
+            new_attn_out, new_lse = torch_fa3(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
+            new_attn_out = new_attn_out.transpose(1, 2)
+        elif backend == "fa2":
+            if dtype == torch.float8_e4m3fn:
+                raise NotImplementedError("float8_e4m3fn is not supported for fa2, choose fa3 or flex")
             new_attn_out, new_lse, _ = flash_attn_func(
                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), return_attn_probs=True
             )
-            new_attn_out = new_attn_out.transpose(1,2)
+            new_attn_out = new_attn_out.transpose(1, 2)
         elif backend == "flex":
             new_attn_out, new_lse = flex_attention(q, k, v, return_lse=True)
         else:
             raise ValueError(
-                f"Invalid backend: {backend}, should be one of ['flash', 'flex']"
+                f"Invalid backend: {backend}, should be one of ['fa2', 'fa3', 'flex']"
             )
 
-        new_attn_out = new_attn_out.to(q.dtype)
-        new_lse = new_lse.to(q.dtype)
+        # todo: what dtype do I want to do the merge in
+        # new_attn_out = new_attn_out.to(q.dtype)
+        # new_lse = new_lse.to(q.dtype)
         new_lse = new_lse.unsqueeze(-1)
         # merge the two attention states
         if step == 0:
@@ -136,6 +137,8 @@ def ring_attention(
 
     return attn_out.to(k.dtype)
 
+
+# some helper functions for context parallel
 
 def split_tensor_cp(x: torch.Tensor, dim: int, ctx: Context) -> torch.Tensor:
     """Helper function to split a tensor along the context parallel dimension."""

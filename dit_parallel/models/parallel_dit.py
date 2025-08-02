@@ -1,13 +1,15 @@
 from __future__ import annotations
-
 import math
+
 import torch
 import torch.nn as nn
 from torch import distributed as dist
 
-from dit_parallel.layers import (
+from dit_parallel.tp import (
     ColumnParallelLinear,
     RowParallelLinear,
+)
+from dit_parallel.ringattention import (
     ring_attention,
     split_tensor_cp,
     gather_tensor_cp,
@@ -15,6 +17,10 @@ from dit_parallel.layers import (
 from dit_parallel.context import Context, setup_distributed
 
 
+# the attention module makes two changes
+# 1. use tp for qkv and proj (split by heads)
+# 2. use ring attention
+#    - Note this ring attention implementation assumes that x is already split along the context parallel dim
 class Attention(nn.Module):
     def __init__(self, dim, num_heads, ctx: Context, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
