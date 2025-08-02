@@ -3,7 +3,6 @@ import math
 
 import torch
 import torch.nn as nn
-from torch import distributed as dist
 
 from dit_parallel.tp import (
     ColumnParallelLinear,
@@ -14,7 +13,7 @@ from dit_parallel.ringattention import (
     split_tensor_cp,
     gather_tensor_cp,
 )
-from dit_parallel.context import Context, setup_distributed
+from dit_parallel.context import Context
 
 
 # the attention module makes two changes
@@ -22,7 +21,7 @@ from dit_parallel.context import Context, setup_distributed
 # 2. use ring attention
 #    - Note this ring attention implementation assumes that x is already split along the context parallel dim
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads, ctx: Context, attn_drop=0.0, proj_drop=0.0):
+    def __init__(self, dim, num_heads, ctx: Context, attn_drop=0.0, proj_drop=0.0, attn_dtype=torch.bfloat16):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
@@ -43,6 +42,7 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.ctx = ctx
         self.num_local_heads = self.num_heads // ctx.tp_pg.size()
+        self.attn_dtype = attn_dtype
 
     def forward(self, x):
         B, N, C = x.shape
@@ -55,7 +55,7 @@ class Attention(nn.Module):
         dropout_p = self.attn_drop.p if self.training else 0.0
         ###
         # assumes x has already been split along the cp dimension
-        x = ring_attention(q, k, v, dropout_p, self.ctx, backend="flash")
+        x = ring_attention(q, k, v, dropout_p, self.ctx, backend="fa3", dtype=self.attn_dtype)
         ###
         x = x.transpose(1, 2).reshape(B, N, C // self.ctx.tp_pg.size())
         return self.proj_drop(self.proj(x))
@@ -126,11 +126,11 @@ class LabelEmbedder(nn.Module):
 
 class Block(nn.Module):
     def __init__(
-        self, d, heads, ctx: Context, mlp_ratio=4, attn_drop=0.0, proj_drop=0.0
+        self, d, heads, ctx: Context, mlp_ratio=4, attn_drop=0.0, proj_drop=0.0, attn_dtype=torch.bfloat16
     ):
         super().__init__()
         self.n1 = nn.LayerNorm(d)
-        self.attn = Attention(d, heads, ctx, attn_drop, proj_drop)
+        self.attn = Attention(d, heads, ctx, attn_drop, proj_drop, attn_dtype=attn_dtype)
         self.n2 = nn.LayerNorm(d)
         self.mlp = nn.Sequential(
             # old:
@@ -161,6 +161,7 @@ class ParallelDiT(nn.Module):
         depth=28,
         heads=16,
         n_cls=1000,
+        attn_dtype=torch.bfloat16,
     ):
         super().__init__()
         self.ctx = ctx
@@ -172,7 +173,7 @@ class ParallelDiT(nn.Module):
         )
         self.time = TimestepEmbedder(d)
         self.label = LabelEmbedder(n_cls, d, 0.1)
-        self.blocks = nn.ModuleList([Block(d, heads, ctx=ctx) for _ in range(depth)])
+        self.blocks = nn.ModuleList([Block(d, heads, ctx=ctx, attn_dtype=attn_dtype) for _ in range(depth)])
         self.norm = nn.LayerNorm(d)
         self.head = nn.Linear(d, patch_size * patch_size * in_c)
         self.out_c = in_c
@@ -188,7 +189,6 @@ class ParallelDiT(nn.Module):
             .reshape(B, self.out_c, h * p, w * p)
         )
 
-    @torch.compile
     def forward(self, img, t, y):
         x = self.patch(img) + self.pos.unsqueeze(0)
         x = x + (self.time(t) + self.label(y, self.training)).unsqueeze(1)
@@ -197,46 +197,3 @@ class ParallelDiT(nn.Module):
             x = blk(x)
         x = gather_tensor_cp(x, dim=1, ctx=self.ctx)
         return self._unpatch(self.head(self.norm(x)))
-
-
-if __name__ == "__main__":
-    size = 2048
-    ctx = setup_distributed(tp_dim=4, cp_dim=2)
-    torch.cuda.set_device(dist.get_rank())
-    device = f"cuda:{dist.get_rank()}"
-    model = ParallelDiT(
-        ctx=ctx, img_size=size, patch_size=8, d=512, depth=28, heads=16
-    ).to(device, dtype=torch.bfloat16)
-
-    # Warmup
-    for _ in range(3):
-        img = torch.randn(1, 4, size, size).to(device, dtype=torch.bfloat16)
-        t = torch.randint(0, 1000, (1,)).to(device, dtype=torch.bfloat16)
-        y = torch.randint(0, 1000, (1,)).to(device)
-        with torch.no_grad():
-            out = model(img, t, y)
-
-    # Benchmark
-    torch.cuda.synchronize()
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-
-    times = []
-    for _ in range(10):
-        img = torch.randn(1, 4, size, size).to(device, dtype=torch.bfloat16)
-        t = torch.randint(0, 1000, (1,)).to(device, dtype=torch.bfloat16)
-        y = torch.randint(0, 1000, (1,)).to(device)
-
-        torch.cuda.synchronize()
-        start_event.record()
-
-        with torch.no_grad():
-            out = model(img, t, y)
-
-        end_event.record()
-        torch.cuda.synchronize()
-        times.append(start_event.elapsed_time(end_event))
-
-    avg_time = sum(times) / len(times)
-    print(f"Average inference time: {avg_time:.2f} ms")
-    print(f"Throughput: {1000 / avg_time:.2f} images/s")

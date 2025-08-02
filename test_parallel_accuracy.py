@@ -1,9 +1,50 @@
-import torch
 import pickle
-from torch import distributed as dist
+import os
 
-from dit_parallel.models.parallel_model import ParallelDiT
+import torch
+from torch import distributed as dist
+from torchao.quantization import quantize_, Float8DynamicActivationFloat8WeightConfig
+
+from dit_parallel.models.reference_dit import DiT
+from dit_parallel.models.parallel_dit import ParallelDiT
 from dit_parallel.context import setup_distributed
+
+
+def get_reference_output():
+    torch.manual_seed(1234)
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    size = 2048
+    ref_model = DiT(
+        img_size=size,
+        patch_size=8,
+        d=512,
+        depth=28,
+        heads=16,
+    ).to(device, dtype=dtype)
+
+    ref_model.eval()
+
+    torch.manual_seed(1234)
+    img = torch.randn(1, 4, size, size, dtype=dtype, device=device)
+    t = torch.randint(0, 1000, (1,)).to("cuda", dtype=torch.bfloat16)
+    y = torch.randint(0, 1000, (1,)).to("cuda")
+
+    with torch.no_grad():
+        ref_output = ref_model(img, t, y)
+
+    data = {
+        "model_state_dict": ref_model.state_dict(),
+        "inputs": {"img": img.cpu(), "t": t.cpu(), "y": y.cpu()},
+        "ref_output": ref_output.cpu(),
+        "device": device,
+        "dtype": str(dtype),
+    }
+
+    os.makedirs("test_outputs", exist_ok=True)
+    with open("test_outputs/ref_model_data.pkl", "wb") as f:
+        pickle.dump(data, f)
 
 
 def load_ref_weights_to_parallel_model(parallel_model, ref_state_dict):
@@ -47,9 +88,8 @@ def print0(s: str):
         print(s)
 
 
-def main():
-    tp_dim = 2
-    cp_dim = 4
+
+def test_parallel_accuracy(tp_dim=2, cp_dim=4, torch_compile=False, quantize_fp8=False):
     ctx = setup_distributed(tp_dim=tp_dim, cp_dim=cp_dim)
     with open("test_outputs/ref_model_data.pkl", "rb") as f:
         ref_data = pickle.load(f)
@@ -61,13 +101,18 @@ def main():
 
     size = 2048
     parallel_model = ParallelDiT(
-        ctx=ctx, img_size=size, patch_size=8, d=512, depth=28, heads=16
+        ctx=ctx, img_size=size, patch_size=8, d=512, depth=28, heads=16, attn_dtype=torch.float8_e4m3fn if quantize_fp8 else torch.bfloat16
     ).to(device, dtype=dtype)
-
     parallel_model.eval()
 
     load_ref_weights_to_parallel_model(parallel_model, ref_data["model_state_dict"])
-    print0("Loaded weights successfully")
+
+    if quantize_fp8:
+        print0("Quantizing model")
+        quantize_(parallel_model.blocks, Float8DynamicActivationFloat8WeightConfig())
+
+    if torch_compile:
+        parallel_model.forward = torch.compile(parallel_model.forward)
 
     torch.manual_seed(1234)
     img = torch.randn(1, 4, size, size, dtype=dtype, device=device)
@@ -78,7 +123,7 @@ def main():
         parallel_output = parallel_model(img, t, y)
 
     print0("\n" + "=" * 50)
-    print0("COMPARISON RESULTS")
+    print0(f"Testing tp={tp_dim} cp={cp_dim}")
     print0("=" * 50)
 
     ref_output = ref_output.to(device, dtype=dtype)
@@ -94,4 +139,20 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            world_size=int(os.environ["WORLD_SIZE"]),
+            rank=int(os.environ["RANK"]),
+            device_id=torch.device(f"cuda:{int(os.environ['RANK'])}")
+        )
+
+    if dist.get_rank() == 0:
+        if not os.path.exists("test_outputs/ref_model_data.pkl"):
+            get_reference_output()
+
+    dist.barrier()
+
+    # torch compile reduces accuracy
+    test_parallel_accuracy(tp_dim=2, cp_dim=4, torch_compile=False, quantize_fp8=False)

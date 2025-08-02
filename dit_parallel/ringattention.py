@@ -1,25 +1,32 @@
+import os
 from typing import Literal
 
 import torch
 from torch import distributed as dist
 from torch.nn import functional as F
 
-# flexattention
 from torch.nn.attention.flex_attention import flex_attention
+
 # fa3 
-import flash_attn_interface
+try:
+    import flash_attn_interface
+except ImportError:
+    if os.environ.get("RANK") == "0":
+        print("flash attention 3 not installed")
+
 # fa2
-from flash_attn import flash_attn_func
+try:
+    from flash_attn import flash_attn_func
+except ImportError:
+    if os.environ.get("RANK") == "0":
+        print("flash attention 2 not installed")
 
 from dit_parallel.context import Context
 
 
 flex_attention = torch.compile(flex_attention)
 
-
-
 # custom op + fake implementation so fa3 works with torch.compile
-
 @torch.library.custom_op("flash::torch_fa3", mutates_args=())
 def torch_fa3(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     softmax_scale = q.shape[-1] ** -0.5
@@ -67,6 +74,11 @@ def ring_attention(
 ) -> torch.Tensor:
     """Functional ring attention implementation.
     Assumes that q, k, v are already split along the context parallel dim."""
+    
+    if backend == "fa3" or backend == "fa2":
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
 
     q = q.to(dtype)
     k = k.to(dtype)
@@ -94,14 +106,15 @@ def ring_attention(
             recv_v = dist.P2POp(dist.irecv, v_buf, group=ctx.cp_pg, group_peer=prev_loc)
             reqs = dist.batch_isend_irecv([send_k, recv_k, send_v, recv_v])
 
+        # todo: get rid of the extra transposes back and forth
         if backend == "fa3":
-            new_attn_out, new_lse = torch_fa3(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
+            new_attn_out, new_lse = torch_fa3(q, k, v)
             new_attn_out = new_attn_out.transpose(1, 2)
         elif backend == "fa2":
             if dtype == torch.float8_e4m3fn:
                 raise NotImplementedError("float8_e4m3fn is not supported for fa2, choose fa3 or flex")
             new_attn_out, new_lse, _ = flash_attn_func(
-                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), return_attn_probs=True
+                q, k, v, return_attn_probs=True
             )
             new_attn_out = new_attn_out.transpose(1, 2)
         elif backend == "flex":
@@ -111,7 +124,7 @@ def ring_attention(
                 f"Invalid backend: {backend}, should be one of ['fa2', 'fa3', 'flex']"
             )
 
-        # todo: what dtype do I want to do the merge in
+        # todo: decide what dtype to accumulate in
         # new_attn_out = new_attn_out.to(q.dtype)
         # new_lse = new_lse.to(q.dtype)
         new_lse = new_lse.unsqueeze(-1)
@@ -134,8 +147,7 @@ def ring_attention(
             k, k_buf = k_buf, k
             v, v_buf = v_buf, v
 
-
-    return attn_out.to(k.dtype)
+    return attn_out.to(torch.bfloat16)
 
 
 # some helper functions for context parallel

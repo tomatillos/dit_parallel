@@ -12,12 +12,13 @@ class Context:
 
 
 def setup_distributed(tp_dim: int, cp_dim: int) -> Context:
-    dist.init_process_group(
-        backend="nccl",
-        init_method="env://",
-        world_size=int(os.environ["WORLD_SIZE"]),
-        rank=int(os.environ["RANK"]),
-    )
+    if not dist.is_initialized():
+        dist.init_process_group(
+            backend="nccl",
+            init_method="env://",
+            world_size=int(os.environ["WORLD_SIZE"]),
+            rank=int(os.environ["RANK"]),
+        )
 
     mesh = init_device_mesh("cuda", (tp_dim, cp_dim), mesh_dim_names=("tp", "cp"))
 
