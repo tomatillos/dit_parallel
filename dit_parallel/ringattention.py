@@ -73,7 +73,9 @@ def ring_attention(
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """Functional ring attention implementation.
-    Assumes that q, k, v are already split along the context parallel dim."""
+    Assumes that q, k, v are already split along the context parallel dim.
+    input shape b n s d
+    """
     
     if backend == "fa3" or backend == "fa2":
         q = q.transpose(1, 2).contiguous()
@@ -84,8 +86,6 @@ def ring_attention(
     k = k.to(dtype)
     v = v.to(dtype)
 
-    k = k.contiguous()
-    v = v.contiguous()
     k_buf = torch.empty_like(k)
     v_buf = torch.empty_like(v)
 
